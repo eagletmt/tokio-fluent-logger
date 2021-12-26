@@ -3,6 +3,7 @@
 pub struct Config {
     fluent_host: String,
     fluent_port: u16,
+    fluent_socket_path: String,
     sub_second_precision: bool,
     max_retry: u32,
     write_timeout: Option<std::time::Duration>,
@@ -13,6 +14,7 @@ impl Default for Config {
         Self {
             fluent_host: "127.0.0.1".to_owned(),
             fluent_port: 24224,
+            fluent_socket_path: "".to_owned(),
             sub_second_precision: false,
             max_retry: 13,
             write_timeout: None,
@@ -33,6 +35,27 @@ pub struct ConfigBuilder {
 }
 
 impl ConfigBuilder {
+    pub fn fluent_host<S>(mut self, value: S) -> Self
+    where
+        S: Into<String>,
+    {
+        self.config.fluent_host = value.into();
+        self
+    }
+
+    pub fn fluent_port(mut self, value: u16) -> Self {
+        self.config.fluent_port = value;
+        self
+    }
+
+    pub fn fluent_socket_path<S>(mut self, value: S) -> Self
+    where
+        S: Into<String>,
+    {
+        self.config.fluent_socket_path = value.into();
+        self
+    }
+
     pub fn sub_second_precision(mut self, value: bool) -> Self {
         self.config.sub_second_precision = value;
         self
@@ -58,17 +81,81 @@ pub enum Error {
     WriteMaxRetryExceeded(u32),
 }
 
+#[async_trait::async_trait]
+pub trait TransportStream: Sized {
+    async fn connect(config: &Config) -> std::io::Result<Self>;
+    async fn write_buf<B>(&self, buf: B) -> std::io::Result<()>
+    where
+        B: bytes::Buf + Send;
+}
+
+pub struct TcpTransport(tokio::net::TcpStream);
+#[async_trait::async_trait]
+impl TransportStream for TcpTransport {
+    async fn connect(config: &Config) -> std::io::Result<Self> {
+        Ok(Self(
+            tokio::net::TcpStream::connect((config.fluent_host.as_str(), config.fluent_port))
+                .await?,
+        ))
+    }
+
+    async fn write_buf<B>(&self, mut buf: B) -> std::io::Result<()>
+    where
+        B: bytes::Buf + Send,
+    {
+        while buf.has_remaining() {
+            self.0.writable().await?;
+            match self.0.try_write(buf.chunk()) {
+                Ok(n) => buf.advance(n),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+pub struct UnixTransport(tokio::net::UnixStream);
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl TransportStream for UnixTransport {
+    async fn connect(config: &Config) -> std::io::Result<Self> {
+        Ok(Self(
+            tokio::net::UnixStream::connect(&config.fluent_socket_path).await?,
+        ))
+    }
+
+    async fn write_buf<B>(&self, mut buf: B) -> std::io::Result<()>
+    where
+        B: bytes::Buf + Send,
+    {
+        while buf.has_remaining() {
+            self.0.writable().await?;
+            match self.0.try_write(buf.chunk()) {
+                Ok(n) => buf.advance(n),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
-pub struct Fluent {
-    // TODO: Support UDP and UNIX domain socket
-    stream: tokio::net::TcpStream,
+pub struct Fluent<S> {
+    stream: S,
     config: Config,
 }
 
-impl Fluent {
+impl<S> Fluent<S>
+where
+    S: TransportStream,
+{
     pub async fn new(config: Config) -> std::io::Result<Self> {
         Ok(Self {
-            stream: connect(&config).await?,
+            stream: S::connect(&config).await?,
             config,
         })
     }
@@ -126,38 +213,20 @@ impl Fluent {
 
     async fn write_with_retry(&self, message: bytes::Bytes) -> Result<(), Error> {
         for _ in 0..self.config.max_retry {
-            if self.write(message.clone()).await? {
+            if self.write(message.clone()).await.is_ok() {
                 return Ok(());
             }
         }
         Err(Error::WriteMaxRetryExceeded(self.config.max_retry))
     }
 
-    async fn write(&self, message: bytes::Bytes) -> std::io::Result<bool> {
+    async fn write(&self, message: bytes::Bytes) -> std::io::Result<()> {
         if let Some(d) = self.config.write_timeout {
-            tokio::time::timeout(d, self.write_all(message)).await?
+            tokio::time::timeout(d, self.stream.write_buf(message)).await?
         } else {
-            self.write_all(message).await
+            self.stream.write_buf(message).await
         }
     }
-
-    async fn write_all(&self, mut message: bytes::Bytes) -> std::io::Result<bool> {
-        use bytes::Buf as _;
-
-        while message.has_remaining() {
-            self.stream.writable().await?;
-            match self.stream.try_write(&message) {
-                Ok(n) => message.advance(n),
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(true)
-    }
-}
-
-async fn connect(config: &Config) -> std::io::Result<tokio::net::TcpStream> {
-    tokio::net::TcpStream::connect((config.fluent_host.as_str(), config.fluent_port)).await
 }
 
 #[derive(Debug)]
