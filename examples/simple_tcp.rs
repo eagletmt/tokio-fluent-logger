@@ -6,7 +6,9 @@ struct Message {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let logger = tokio_fluent_logger::Fluent::<tokio_fluent_logger::TcpTransport>::new(
+    let transport = tokio_fluent_logger::TcpTransport::new("localhost", 24224);
+    let logger = tokio_fluent_logger::Fluent::new(
+        transport,
         tokio_fluent_logger::Config::builder()
             .sub_second_precision(true)
             .build(),

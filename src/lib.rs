@@ -1,9 +1,6 @@
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct Config {
-    fluent_host: String,
-    fluent_port: u16,
-    fluent_socket_path: String,
     sub_second_precision: bool,
     max_retry: u32,
     write_timeout: Option<std::time::Duration>,
@@ -12,9 +9,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            fluent_host: "127.0.0.1".to_owned(),
-            fluent_port: 24224,
-            fluent_socket_path: "".to_owned(),
             sub_second_precision: false,
             max_retry: 13,
             write_timeout: None,
@@ -35,27 +29,6 @@ pub struct ConfigBuilder {
 }
 
 impl ConfigBuilder {
-    pub fn fluent_host<S>(mut self, value: S) -> Self
-    where
-        S: Into<String>,
-    {
-        self.config.fluent_host = value.into();
-        self
-    }
-
-    pub fn fluent_port(mut self, value: u16) -> Self {
-        self.config.fluent_port = value;
-        self
-    }
-
-    pub fn fluent_socket_path<S>(mut self, value: S) -> Self
-    where
-        S: Into<String>,
-    {
-        self.config.fluent_socket_path = value.into();
-        self
-    }
-
     pub fn sub_second_precision(mut self, value: bool) -> Self {
         self.config.sub_second_precision = value;
         self
@@ -83,29 +56,44 @@ pub enum Error {
 
 #[async_trait::async_trait]
 pub trait TransportStream: Sized {
-    async fn connect(config: &Config) -> std::io::Result<Self>;
-    async fn write_buf<B>(&self, buf: B) -> std::io::Result<()>
+    type Stream;
+
+    async fn connect(&self) -> std::io::Result<Self::Stream>;
+    async fn write_buf<B>(&self, stream: &Self::Stream, buf: B) -> std::io::Result<()>
     where
         B: bytes::Buf + Send;
 }
 
-pub struct TcpTransport(tokio::net::TcpStream);
+pub struct TcpTransport {
+    host: String,
+    port: u16,
+}
+impl TcpTransport {
+    pub fn new<S>(host: S, port: u16) -> Self
+    where
+        S: Into<String>,
+    {
+        Self {
+            host: host.into(),
+            port,
+        }
+    }
+}
 #[async_trait::async_trait]
 impl TransportStream for TcpTransport {
-    async fn connect(config: &Config) -> std::io::Result<Self> {
-        Ok(Self(
-            tokio::net::TcpStream::connect((config.fluent_host.as_str(), config.fluent_port))
-                .await?,
-        ))
+    type Stream = tokio::net::TcpStream;
+
+    async fn connect(&self) -> std::io::Result<Self::Stream> {
+        Ok(Self::Stream::connect((self.host.as_str(), self.port)).await?)
     }
 
-    async fn write_buf<B>(&self, mut buf: B) -> std::io::Result<()>
+    async fn write_buf<B>(&self, stream: &Self::Stream, mut buf: B) -> std::io::Result<()>
     where
         B: bytes::Buf + Send,
     {
         while buf.has_remaining() {
-            self.0.writable().await?;
-            match self.0.try_write(buf.chunk()) {
+            stream.writable().await?;
+            match stream.try_write(buf.chunk()) {
                 Ok(n) => buf.advance(n),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(e),
@@ -116,24 +104,34 @@ impl TransportStream for TcpTransport {
 }
 
 #[cfg(unix)]
-pub struct UnixTransport(tokio::net::UnixStream);
-
+pub struct UnixTransport {
+    path: std::path::PathBuf,
+}
+#[cfg(unix)]
+impl UnixTransport {
+    pub fn new<P>(path: P) -> Self
+    where
+        P: Into<std::path::PathBuf>,
+    {
+        Self { path: path.into() }
+    }
+}
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl TransportStream for UnixTransport {
-    async fn connect(config: &Config) -> std::io::Result<Self> {
-        Ok(Self(
-            tokio::net::UnixStream::connect(&config.fluent_socket_path).await?,
-        ))
+    type Stream = tokio::net::UnixStream;
+
+    async fn connect(&self) -> std::io::Result<Self::Stream> {
+        Ok(Self::Stream::connect(&self.path).await?)
     }
 
-    async fn write_buf<B>(&self, mut buf: B) -> std::io::Result<()>
+    async fn write_buf<B>(&self, stream: &Self::Stream, mut buf: B) -> std::io::Result<()>
     where
         B: bytes::Buf + Send,
     {
         while buf.has_remaining() {
-            self.0.writable().await?;
-            match self.0.try_write(buf.chunk()) {
+            stream.writable().await?;
+            match stream.try_write(buf.chunk()) {
                 Ok(n) => buf.advance(n),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(e),
@@ -144,37 +142,46 @@ impl TransportStream for UnixTransport {
 }
 
 #[derive(Debug)]
-pub struct Fluent<S> {
-    stream: S,
+pub struct Fluent<T>
+where
+    T: TransportStream,
+{
+    transport: T,
+    stream: T::Stream,
     config: Config,
 }
 
-impl<S> Fluent<S>
+impl<T> Fluent<T>
 where
-    S: TransportStream,
+    T: TransportStream,
 {
-    pub async fn new(config: Config) -> std::io::Result<Self> {
+    pub async fn new(transport: T, config: Config) -> std::io::Result<Self> {
         Ok(Self {
-            stream: S::connect(&config).await?,
+            stream: transport.connect().await?,
+            transport,
             config,
         })
     }
 
-    pub async fn post<T>(&self, tag: &str, message: T) -> Result<(), Error>
+    pub fn stream(&self) -> &T::Stream {
+        &self.stream
+    }
+
+    pub async fn post<U>(&self, tag: &str, message: U) -> Result<(), Error>
     where
-        T: serde::Serialize,
+        U: serde::Serialize,
     {
         self.post_with_time(tag, chrono::Utc::now(), message).await
     }
 
-    pub async fn post_with_time<T, Tz>(
+    pub async fn post_with_time<U, Tz>(
         &self,
         tag: &str,
         time: chrono::DateTime<Tz>,
-        message: T,
+        message: U,
     ) -> Result<(), Error>
     where
-        T: serde::Serialize,
+        U: serde::Serialize,
         Tz: chrono::TimeZone,
     {
         let message = self.encode_data(tag, time, message)?;
@@ -182,14 +189,14 @@ where
         Ok(())
     }
 
-    fn encode_data<T, Tz>(
+    fn encode_data<U, Tz>(
         &self,
         tag: &str,
         time: chrono::DateTime<Tz>,
-        record: T,
+        record: U,
     ) -> Result<bytes::Bytes, rmp_serde::encode::Error>
     where
-        T: serde::Serialize,
+        U: serde::Serialize,
         Tz: chrono::TimeZone,
     {
         use bytes::BufMut as _;
@@ -222,9 +229,9 @@ where
 
     async fn write(&self, message: bytes::Bytes) -> std::io::Result<()> {
         if let Some(d) = self.config.write_timeout {
-            tokio::time::timeout(d, self.stream.write_buf(message)).await?
+            tokio::time::timeout(d, self.transport.write_buf(&self.stream, message)).await?
         } else {
-            self.stream.write_buf(message).await
+            self.transport.write_buf(&self.stream, message).await
         }
     }
 }
@@ -253,5 +260,92 @@ where
         buf.put_u32(self.0.timestamp_subsec_nanos() as u32);
         serializer
             .serialize_newtype_struct(rmp_serde::MSGPACK_EXT_STRUCT_NAME, &(EVENT_TIME_TYPE, buf))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    struct TestTransport {}
+    #[async_trait::async_trait]
+    impl super::TransportStream for TestTransport {
+        type Stream = std::sync::Mutex<std::cell::RefCell<Vec<bytes::Bytes>>>;
+
+        async fn connect(&self) -> std::io::Result<Self::Stream> {
+            Ok(std::sync::Mutex::new(std::cell::RefCell::new(Vec::new())))
+        }
+
+        async fn write_buf<B>(&self, stream: &Self::Stream, mut buf: B) -> std::io::Result<()>
+        where
+            B: bytes::Buf + Send,
+        {
+            let b = buf.copy_to_bytes(buf.remaining());
+            let queue = stream.lock().unwrap();
+            queue.borrow_mut().push(b);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct TestMessage {
+        message: &'static str,
+    }
+
+    use chrono::TimeZone as _;
+
+    #[tokio::test]
+    async fn it_sends_a_message() {
+        let logger = super::Fluent::new(TestTransport {}, super::Config::default())
+            .await
+            .unwrap();
+        let time = chrono::Utc.timestamp(1640612102, 750781000);
+        logger
+            .post_with_time("tag.name", time, TestMessage { message: "bar" })
+            .await
+            .unwrap();
+        let queue = logger.stream().lock().unwrap();
+        let queue = queue.borrow();
+        assert_eq!(queue.len(), 1);
+        // 0x93 == 0x90 + 3: fixarray with N=3
+        // 0xa8 == 0xa0 + 8: fixstr with N=8
+        // 0xce: uint 32
+        // 0x61c9c106 == 1640612102
+        // 0x81 == 0x80 + 1: fixmap with N=1
+        // 0xa7 == 0xa0 + 7: fixstr with N=7
+        // 0xa3 == 0xa0 + 3: fixstr with N=3
+        assert_eq!(
+            queue[0].as_ref(),
+            b"\x93\xa8tag.name\xce\x61\xc9\xc1\x06\x81\xa7message\xa3bar"
+        );
+    }
+
+    #[tokio::test]
+    async fn it_sends_a_message_with_sub_second() {
+        let logger = super::Fluent::new(
+            TestTransport {},
+            super::Config::builder().sub_second_precision(true).build(),
+        )
+        .await
+        .unwrap();
+        let time = chrono::Utc.timestamp(1640612102, 750781000);
+        logger
+            .post_with_time("tag.name", time, TestMessage { message: "bar" })
+            .await
+            .unwrap();
+        let queue = logger.stream().lock().unwrap();
+        let queue = queue.borrow();
+        assert_eq!(queue.len(), 1);
+        // 0x93 == 0x90 + 3: fixarray with N=3
+        // 0xa8 == 0xa0 + 8: fixstr with N=8
+        // 0xd7: fixext 8
+        // 0x00:   type == 0
+        // 0x61c9c106 == 1640612102
+        // 0x2cc00248 == 750781000
+        // 0x81 == 0x80 + 1: fixmap with N=1
+        // 0xa7 == 0xa0 + 7: fixstr with N=7
+        // 0xa3 == 0xa0 + 3: fixstr with N=3
+        assert_eq!(
+            queue[0].as_ref(),
+            b"\x93\xa8tag.name\xd7\x00\x61\xc9\xc1\x06\x2c\xc0\x02\x48\x81\xa7message\xa3bar"
+        );
     }
 }

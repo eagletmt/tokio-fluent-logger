@@ -6,9 +6,10 @@ struct Message {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let logger = tokio_fluent_logger::Fluent::<tokio_fluent_logger::UnixTransport>::new(
+    let transport = tokio_fluent_logger::UnixTransport::new("./fluentd.sock");
+    let logger = tokio_fluent_logger::Fluent::new(
+        transport,
         tokio_fluent_logger::Config::builder()
-            .fluent_socket_path("./fluentd.sock")
             .sub_second_precision(true)
             .build(),
     )
