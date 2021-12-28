@@ -1,0 +1,20 @@
+version: '3.8'
+services:
+  fluentd:
+    image: fluent/fluentd:v1.14
+    ports:
+      - 127.0.0.1:24224:24224
+    volumes:
+      - type: bind
+        source: ./fluentd.conf
+        target: /fluentd/etc/fluent.conf
+        read_only: true
+  fluent-bit:
+    image: fluent/fluent-bit:1.8
+    ports:
+      - 127.0.0.1:24225:24224
+    volumes:
+      - type: bind
+        source: ./fluent-bit.conf
+        target: /fluent-bit/etc/fluent-bit.conf
+        read_only: true
